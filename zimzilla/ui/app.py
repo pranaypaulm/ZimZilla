@@ -1381,22 +1381,59 @@ class ZimZillaApp(App):
         )
 
     def _copy_selection(self, text: str) -> None:
-        """Put *text* on the clipboard. Never fatal — a headless or
-        OSC-52-less terminal just keeps the in-app clipboard."""
+        """Put *text* on the clipboard.
+
+        Textual's copy_to_clipboard writes OSC 52, which VTE/gnome-terminal
+        silently drops — so the selection is copied *nowhere* and the operator
+        sees a "copied" toast for a clipboard that never changed. Try the
+        native tools too: wl-copy on Wayland, xclip/xsel elsewhere.
+        """
         text = (text or "").rstrip("\n")
         if not text.strip():
             return
+        via = None
+        fallback = self._native_clipboard(text)
         try:
             self.copy_to_clipboard(text)
+            via = "osc52" if fallback is None else f"osc52+{fallback}"
         except Exception:
-            return
+            via = fallback
+        if fallback:
+            via = fallback if via is None else via
         try:
             bar = self.query_one(StatusBar)
             n = len(text)
-            bar.set_activity(f"copied {n} char{'s' if n != 1 else ''}", busy=False)
+            suffix = f" via {via}" if via else " (terminal ignored OSC 52 — no clipboard tool)"
+            bar.set_activity(f"copied {n} char{'s' if n != 1 else ''}{suffix}", busy=False)
             bar.render_bar()
         except Exception:
             pass
+
+    @staticmethod
+    def _native_clipboard(text: str) -> str | None:
+        """Write *text* with a real clipboard tool. Returns the tool used."""
+        import os
+        import shutil
+        import subprocess
+
+        candidates: list[list[str]] = []
+        if os.environ.get("WAYLAND_DISPLAY"):
+            candidates.append(["wl-copy"])
+        candidates.append(["xclip", "-selection", "clipboard"])
+        candidates.append(["xsel", "-ib"])
+        for cmd in candidates:
+            if shutil.which(cmd[0]) is None:
+                continue
+            try:
+                done = subprocess.run(
+                    cmd, input=text.encode("utf-8"), timeout=3,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                continue
+            if done.returncode == 0:
+                return cmd[0]
+        return None
 
     def on_text_selected(self, event: TextSelected) -> None:
         """Mouse-up after a drag across the transcript, rails, or zim-pane."""
